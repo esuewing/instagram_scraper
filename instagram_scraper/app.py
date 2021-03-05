@@ -95,10 +95,10 @@ class TagDataframe(object):
             self.df_flag = False
         self.hashtags = set()
 
-    def checkDF(self, hashtag, filename):
-        query_expr = "(hashtag == @hashtag) and (filename == @filename )"
+    def checkDF(self, hashtag, urls):
+        query_expr = "(hashtag == @hashtag) and (urls == @urls )"
         self.df.query(query_expr)
-        return bool(self.df.query(query_expr)['filename'].any())
+        return bool(self.df.query(query_expr)['urls'].any())
 
     def getLastTag(self, hashtag):
         if self.df_flag:
@@ -116,6 +116,10 @@ class TagDataframe(object):
         data = {'hashtag' : hashtag, 'filename' : filename, 'end_cursor' : self.end_cursor, 'check_display_url' : check_display_url, 'shortcode' : shortcode}
         self.df = self.df.append(data, ignore_index=True)
 
+    def appendDFforDownload(self, hashtag, url, check_display_url, shortcode):
+        data = {'hashtag' : hashtag, 'urls' : url, 'end_cursor' : self.end_cursor, 'check_display_url' : check_display_url, 'shortcode' : shortcode}
+        self.df = self.df.append(data, ignore_index=True)
+
     def addHashtag(self, hashtag):
         self.hashtags.add(hashtag)
 
@@ -130,7 +134,7 @@ class TagDataframe(object):
 
     def saveToCsv(self, filename):
         #df = self.df.drop_duplicates()
-        df.to_csv(filename, index=False)
+        self.df.to_csv(filename, index=False)
 
 
     def checkItemisinDF(self, hashtag, item):
@@ -584,10 +588,11 @@ class InstagramScraper(object):
                                 check_display_url = 1
                             else:
                                 check_display_url = 0
-                            self.td.appendDF(value, fullfilename, check_display_url, shortcode)
+                            #self.td.appendDF(value, fullfilename, check_display_url, shortcode)
+                            self.td.appendDFforDownload(value, url, check_display_url, shortcode)
 
-                        future = executor.submit(self.worker_wrapper, self.download, item, dst)
-                        future_to_item[future] = item
+                        # future = executor.submit(self.worker_wrapper, self.download, item, dst)
+                        # future_to_item[future] = item
 
                     if self.include_location and 'location' not in item:
                         media_exec.submit(self.worker_wrapper, self.__get_location, item)
@@ -629,6 +634,62 @@ class InstagramScraper(object):
             self.quit = True
             self.td.saveToCsv(self.csv_file)
 
+    def download_df(self, executor=concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS)):
+        """Scrapes the specified value for posted media."""
+        self.quit = False
+
+        # tony edited
+        #csv_file = '~/Docker_Containers/BabyScraper_pcn_reduced/insta_crawler/tagdata.csv'
+        #csv_file = '~/Docker_Containers/BabyScraper_pcn_reduced/new_tagdata.csv'
+        #td = TagDataframe(csv_file)
+
+        try:
+            for value in self.usernames:
+                self.last_scraped_filemtime = 0
+                greatest_timestamp = 0
+                future_to_item = {}
+
+                dst = self.get_dst_dir(value)
+
+                df = self.td.getDF()
+                items = df.to_dict('index')
+                #print(items)
+                for index in items:
+                    item = items[index]
+
+                    urls = []
+                    urls.append(item['urls'])
+                    item['urls'] = urls
+                    print(item['urls'])
+
+                    future = executor.submit(self.worker_wrapper, self.download_dict, item, dst)
+                    future_to_item[future] = item
+
+                    
+
+                if future_to_item:
+                    for future in tqdm.tqdm(concurrent.futures.as_completed(future_to_item),
+                                            total=len(future_to_item),
+                                            desc='Downloading', disable=self.quiet):
+                        item = future_to_item[future]
+
+                        if future.exception() is not None:
+                            self.logger.warning(
+                                'Media for {0} at {1} generated an exception: {2}'.format(value, item['urls'],
+                                                                                          future.exception()))
+                        else:
+                            timestamp = self.__get_timestamp(item)
+                            if timestamp > greatest_timestamp:
+                                greatest_timestamp = timestamp
+                # Even bother saving it?
+                if greatest_timestamp > self.last_scraped_filemtime:
+                    self.set_last_scraped_timestamp(value, greatest_timestamp)
+
+                self._persist_metadata(dst, value)
+
+        finally:
+            self.quit = True
+            self.td.saveToCsv(self.csv_file)
 
 
     def query_hashtag_gen(self, hashtag):
@@ -1372,6 +1433,130 @@ class InstagramScraper(object):
 
         return files_path
 
+    def download_dict(self, item, save_dir='./'):
+        """Downloads the media file."""
+        # nedd item dictionary keys = ['urls', 'shortcode']
+
+        # if self.filter_locations:
+        #     save_dir = os.path.join(save_dir, self.get_key_from_value(self.filter_locations, item["location"]["id"]))
+
+        files_path = []
+
+        for full_url, base_name in self.templatefilename_dict(item):
+            url = full_url.split('?')[0] #try the static url first, stripping parameters
+
+            file_path = os.path.join(save_dir, base_name)
+
+            if not os.path.exists(os.path.dirname(file_path)):
+                self.make_dir(os.path.dirname(file_path))
+
+            if not os.path.isfile(file_path):
+                headers = {'Host': urlparse(url).hostname}
+
+                part_file = file_path + '.part'
+                downloaded = 0
+                total_length = None
+                #print("download part_file : ", part_file)
+                with open(part_file, 'wb') as media_file:
+                    try:
+                        retry = 0
+                        retry_delay = RETRY_DELAY
+                        while (True):
+                            if self.quit:
+                                return
+                            try:
+                                downloaded_before = downloaded
+                                headers['Range'] = 'bytes={0}-'.format(downloaded_before)
+
+                                with self.session.get(url, cookies=self.cookies, headers=headers, stream=True, timeout=CONNECT_TIMEOUT) as response:
+                                    if response.status_code == 404 or response.status_code == 410:
+                                        #on 410 error see issue #343
+                                        #instagram don't lie on this
+                                        break
+                                    if response.status_code == 403 and url != full_url:
+                                        #see issue #254
+                                        url = full_url
+                                        continue
+                                    response.raise_for_status()
+
+                                    if response.status_code == 206:
+                                        try:
+                                            match = re.match(r'bytes (?P<first>\d+)-(?P<last>\d+)/(?P<size>\d+)', response.headers['Content-Range'])
+                                            range_file_position = int(match.group('first'))
+                                            if range_file_position != downloaded_before:
+                                                raise Exception()
+                                            total_length = int(match.group('size'))
+                                            media_file.truncate(total_length)
+                                        except:
+                                            raise requests.exceptions.InvalidHeader('Invalid range response "{0}" for requested "{1}"'.format(
+                                                response.headers.get('Content-Range'), headers.get('Range')))
+                                    elif response.status_code == 200:
+                                        if downloaded_before != 0:
+                                            downloaded_before = 0
+                                            downloaded = 0
+                                            media_file.seek(0)
+                                        content_length = response.headers.get('Content-Length')
+                                        if content_length is None:
+                                            self.logger.warning('No Content-Length in response, the file {0} may be partially downloaded'.format(base_name))
+                                        else:
+                                            total_length = int(content_length)
+                                            media_file.truncate(total_length)
+                                    else:
+                                        raise PartialContentException('Wrong status code {0}', response.status_code)
+
+                                    for chunk in response.iter_content(chunk_size=64*1024):
+                                        if chunk:
+                                            downloaded += len(chunk)
+                                            media_file.write(chunk)
+                                        if self.quit:
+                                            return
+
+                                if downloaded != total_length and total_length is not None:
+                                    raise PartialContentException('Got first {0} bytes from {1}'.format(downloaded, total_length))
+
+                                break
+
+                            # In case of exception part_file is not removed on purpose,
+                            # it is easier to exemine it later when analising logs.
+                            # Please do not add os.remove here.
+                            except (KeyboardInterrupt):
+                                raise
+                            except (requests.exceptions.RequestException, PartialContentException) as e:
+                                media = url
+                                if item['shortcode'] and item['shortcode'] != '':
+                                    media += " from https://www.instagram.com/p/" + item['shortcode']
+                                if downloaded - downloaded_before > 0:
+                                    # if we got some data on this iteration do not count it as a failure
+                                    self.logger.warning('Continue after exception {0} on {1}'.format(repr(e), media))
+                                    retry = 0 # the next fail will be first in a row with no data
+                                    continue
+                                if retry < MAX_RETRIES:
+                                    self.logger.warning('Retry after exception {0} on {1}'.format(repr(e), media))
+                                    self.sleep(retry_delay)
+                                    retry_delay = min( 2 * retry_delay, MAX_RETRY_DELAY )
+                                    retry = retry + 1
+                                    continue
+                                else:
+                                    keep_trying = self._retry_prompt(media, repr(e))
+                                    if keep_trying == True:
+                                        retry = 0
+                                        continue
+                                    elif keep_trying == False:
+                                        break
+                                raise
+                    finally:
+                        media_file.truncate(downloaded)
+
+                if downloaded == total_length or total_length is None and downloaded > 100:
+                    os.rename(part_file, file_path)
+                    #timestamp = self.__get_timestamp(item)
+                    file_time = int(time.time())
+                    os.utime(file_path, (file_time, file_time))
+
+            files_path.append(file_path)
+
+        return files_path
+
     def dowload_broadcast(self, item, save_dir='./'):
         tmp_item = {
             'urls': [item['video']],
@@ -1424,6 +1609,13 @@ class InstagramScraper(object):
             except KeyError:
                 customfilename = str(filename + extension)
                 yield url, customfilename
+    
+    def templatefilename_dict(self, item):
+
+        for url in item['urls']:
+            filename, extension = os.path.splitext(os.path.split(url.split('?')[0])[1])
+            customfilename = str(filename + extension)
+            yield url, customfilename
 
     def is_new_media(self, item):
         """Returns True if the media is new."""

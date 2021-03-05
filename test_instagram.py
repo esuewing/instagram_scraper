@@ -52,6 +52,7 @@ class InstagramTests():
 it = InstagramTests()
 it.setUp()
 it.scraper.scrape_hashtag()
+#it.scraper.download_df()
 
 
 
