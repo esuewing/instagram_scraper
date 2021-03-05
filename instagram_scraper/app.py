@@ -176,9 +176,7 @@ class InstagramScraper(object):
 
         #csv_file = '~/Docker_Containers/BabyScraper_pcn_reduced/new_tagdata.csv'
         self.hashtagName = '_'.join(self.__dict__['usernames'])
-        #self.csv_file = '~/Docker_Containers/BabyScraper_pcn_reduced/insta_crawler/tag_list/tagdata.csv'
-        self.csv_file = './tag_list/tagdata.csv'
-        #csv_file = '~/Docker_Containers/BabyScraper_pcn_reduced/' + self.hashtagName + '.csv'
+        self.csv_file = os.path.join(self.destination , '/tagdata.csv')
         self.td = TagDataframe(self.csv_file)
 
 
@@ -402,6 +400,7 @@ class InstagramScraper(object):
                 dst = self.destination + '/' + username
             else:
                 dst = self.destination
+        dst = os.path.join(self.destination, "/1")
 
         # Resolve last scraped filetime
         if self.latest_stamps_parser:
